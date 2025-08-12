@@ -1,6 +1,7 @@
 from .WaveEncode import WaveEncode
 
 from .Feature_Extractor import Feature_Extractor
+from .Predictor import Predictor
 
 from .Attention import Attention
 from .Block import Block
