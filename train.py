@@ -4,6 +4,9 @@ from torch.nn import functional as F
 import copy
 import torchaudio
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
+import math
 
 # --- 헬퍼 함수 및 클래스 (사용자 제공) ---
 
@@ -90,12 +93,9 @@ class Predictor(nn.Module):
         x = context_features + context_pos
         
         # 예측 (Transformer Decoder와 유사한 역할)
-        # 간단한 구현을 위해 context만으로 예측
         predicted_sequence = self.predictor_mock(x)
         
         # target 위치에 해당하는 결과만 선택 (단순화된 예시)
-        # 실제로는 context와 target 위치 정보를 모두 활용해야 함
-        # 여기서는 context의 평균으로 target을 예측하는 매우 단순한 방식을 사용
         mean_context = predicted_sequence.mean(dim=1, keepdim=True)
         predicted_target = mean_context.expand(-1, target_indices.shape[1], -1)
         predicted_target = predicted_target + target_pos
@@ -189,11 +189,9 @@ def collate_fn(batch, sample_rate=16000, duration=10):
     lengths = []
     
     for (waveform, sr, _, _, _, _) in batch:
-        # 채널이 2개 이상이면 1개로 평균
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-        # sample rate가 다르면 리샘플링
         if sr != sample_rate:
             resampler = torchaudio.transforms.Resample(sr, sample_rate)
             waveform = resampler(waveform)
@@ -201,33 +199,50 @@ def collate_fn(batch, sample_rate=16000, duration=10):
         current_len = waveform.shape[1]
         
         if current_len < target_len:
-            # 길이가 짧으면 0으로 패딩
             padding = target_len - current_len
             padded_waveform = F.pad(waveform, (0, padding))
             waveforms.append(padded_waveform)
-            lengths.append(current_len) # 패딩 전 원래 길이 저장
+            lengths.append(current_len)
         else:
-            # 길이가 길면 랜덤하게 10초를 잘라냄
             start = torch.randint(0, current_len - target_len + 1, (1,)).item()
             truncated_waveform = waveform[:, start:start + target_len]
             waveforms.append(truncated_waveform)
-            lengths.append(target_len) # 잘라낸 길이 저장
+            lengths.append(target_len)
             
-    # 리스트를 텐서로 변환
     waveforms_tensor = torch.cat(waveforms, dim=0)
     lengths_tensor = torch.tensor(lengths, dtype=torch.long)
     
     return waveforms_tensor, lengths_tensor
 
 
+def get_lr_scheduler(optimizer, max_iter, warmup_iter, final_lr):
+    """ Warm-up 후 Cosine Decay를 적용하는 LambdaLR 스케줄러를 생성합니다. """
+    base_lr = optimizer.param_groups[0]['lr']
+    
+    def lr_lambda(current_iter):
+        if current_iter < warmup_iter:
+            # Warm-up: 선형적으로 학습률 증가
+            return float(current_iter) / float(max(1, warmup_iter))
+        else:
+            # Cosine Decay: 학습률 감소
+            progress = float(current_iter - warmup_iter) / float(max(1, max_iter - warmup_iter))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # 최종 학습률에 도달하도록 스케일링
+            scaled_lr = final_lr + (base_lr - final_lr) * cosine_decay
+            return scaled_lr / base_lr # LambdaLR은 base_lr에 곱해지는 비율을 반환해야 함
+
+    return LambdaLR(optimizer, lr_lambda)
+
 def main():
     # --- 학습 하이퍼파라미터 ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    batch_size = 8 # GPU 메모리에 맞춰 조정하세요
-    learning_rate = 4e-3
-    num_epochs = 5 # 예제용 epoch 수
+    batch_size = 8
+    base_learning_rate = 4e-3
+    final_learning_rate = 1e-8
+    num_epochs = 10 # 10 에포크로 변경
+    warmup_iter = 500 # Warm-up 이터레이션
     
     # --- 모델 하이퍼파라미터 설정 ---
     conv_configs = [
@@ -242,22 +257,19 @@ def main():
     predictor_layers = 4
     predictor_heads = 8
     
-    # 10초 오디오(160000 샘플) / 총 stride(320) = 500
-    # 모의 모델의 stride는 160이므로, 160000/160 = 1000
     max_seq_len = 10_000
 
     # --- 데이터셋 및 DataLoader 준비 ---
     print("Loading LibriSpeech dataset...")
     try:
-        # 'train-clean-100'은 약 28GB입니다.
         train_dataset = torchaudio.datasets.LIBRISPEECH(
             root='./data',
             url='train-clean-100',
             download=True
         )
     except Exception as e:
-        print(f"Failed to download dataset. Please check your connection or storage.")
-        print(f"Error: {e}")
+        print(f"Failed to download or load dataset: {e}")
+        print("Please check your internet connection or data directory permissions.")
         return
 
     train_loader = DataLoader(
@@ -265,7 +277,7 @@ def main():
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4, # 시스템에 맞게 조정
+        num_workers=4,
         pin_memory=True
     )
     
@@ -290,21 +302,29 @@ def main():
     w_jepa_model = W_JEPA(
         encoder=encoder,
         predictor=predictor,
-        mask_ratio=0.75, # I-JEPA 논문에서 사용한 값 중 하나
+        mask_ratio=0.75,
         mask_span_length=10
     ).to(device)
     
-    optimizer = torch.optim.AdamW(w_jepa_model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(w_jepa_model.parameters(), lr=base_learning_rate)
+    
+    # --- 스케줄러 설정 ---
+    max_iter = len(train_loader) * num_epochs
+    scheduler = get_lr_scheduler(optimizer, max_iter, warmup_iter, final_learning_rate)
     
     # --- 학습 루프 ---
     print("--- Start Training Loop ---")
+    current_iter = 0
     for epoch in range(num_epochs):
         w_jepa_model.train()
         total_loss = 0
         
-        for i, (waveforms, lengths) in enumerate(train_loader):
-            waveforms = waveforms.to(device)
-            lengths = lengths.to(device)
+        # tqdm을 이용한 progress bar 설정
+        pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}]")
+        
+        for waveforms, lengths in pbar:
+            waveforms = waveforms.to(device, non_blocking=True)
+            lengths = lengths.to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
@@ -312,11 +332,13 @@ def main():
             
             loss.backward()
             optimizer.step()
+            scheduler.step() # 이터레이션마다 스케줄러 업데이트
             
             total_loss += loss.item()
+            current_iter += 1
             
-            if (i + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+            # tqdm progress bar에 현재 손실과 학습률 표시
+            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
     
         avg_loss = total_loss / len(train_loader)
         print(f"--- Epoch {epoch+1} Finished, Average Loss: {avg_loss:.4f} ---")
