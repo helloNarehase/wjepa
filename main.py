@@ -1,5 +1,6 @@
 import torch
 from torch import nn, einsum
+from torch.nn import functional as F
 import copy
 
 # 이 파일이 models 폴더 내에 있다고 가정하고 상대 경로로 임포트합니다.
@@ -146,8 +147,9 @@ class W_JEPA(nn.Module):
         predicted_target = self.predictor.enc(encoded_context, context_indices, target_indices)
         
         # 7. Loss 계산 (Mean Squared Error)
-        loss = nn.functional.mse_loss(predicted_target, encoded_target)
-        
+        loss = F.l1_loss(predicted_target, encoded_target)
+        # loss = F.mse_loss(predicted_target, encoded_target)
+        # print(predicted_target.shape, encoded_target.shape)
         return loss, predicted_target, encoded_target
 
 # --- 모델 실행 및 학습 예제 ---
