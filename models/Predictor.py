@@ -27,12 +27,13 @@ class Predictor(nn.Module):
                 1, max_seq_len, dim
             )
         )
+        self.ln = nn.LayerNorm(dim)
 
 
     def encode(self, x:torch.Tensor, mask:torch.Tensor|None):
         for block in self.blocks:
             x, _ = block(x, mask)
-        return x
+        return self.ln(x)
 
     def enc(self, x:torch.Tensor, context_indices:torch.Tensor, target_indices:torch.Tensor):
         B, N_ctx, _ = x.shape
