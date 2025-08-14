@@ -3,7 +3,7 @@ from torch import nn, einsum
 from torch.nn import functional as F
 import copy
 import torchaudio
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, random_split
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import math
@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", message="In 2.9, this function's implementatio
 # warnings.filterwarnings("ignore", message="torch.nn.functional. अभी तक कार्यान्वित नहीं है for 'gumbel_softmax'") << ?? Gemini 2.5 pro Hallusination
 
 
-# --- [수정] AverageMeter 클래스 정의 ---
+# --- AverageMeter 클래스 정의 ---
 class AverageMeter:
     """Computes and stores the average, current value, and history of values."""
     def __init__(self):
@@ -156,7 +156,8 @@ class W_JEPA(nn.Module):
         encoded_context = self.context_encoder.encode(context_features, lengths=None)
 
         with torch.no_grad():
-            self._update_target_encoder()
+            if self.training: # [추가] 학습 중에만 EMA 업데이트 수행
+                self._update_target_encoder()
             full_encoded_features = self.target_encoder.encode(feature, lengths=new_lengths.to(device))
             encoded_target = torch.gather(full_encoded_features, 1, target_indices.unsqueeze(-1).expand(-1, -1, D_in))
 
@@ -233,10 +234,13 @@ def main():
     encoder_dim = 512
     encoder_layers = 6
     encoder_heads = 8
+    encoder_dropout = 0.1
+    encoder_droppath = 0.1
     
     predictor_dim = 512
     predictor_layers = 4
     predictor_heads = 8
+    predictor_droppath = 0.1
     
     max_seq_len = 10_000 # Predictor의 pos_embedding 크기와 관련
 
@@ -262,16 +266,36 @@ def main():
             url='train-other-500',
             download=True
         )
-        train_dataset = ConcatDataset([train_clean_100, train_clean_360, train_other_500])
+        full_dataset = ConcatDataset([train_clean_100, train_clean_360, train_other_500])
 
     except Exception as e:
         print(f"Failed to download or load dataset: {e}")
         return
 
+    # --- [추가] 데이터셋을 학습용과 검증용으로 분리 ---
+    dataset_size = len(full_dataset)
+    val_size = int(0.2 * dataset_size)
+    train_size = dataset_size - val_size
+    print(f"Splitting dataset: {train_size} for training, {val_size} for validation.")
+    
+    # [추가] 재현성을 위해 시드 고정
+    generator = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # --- [추가] 검증용 DataLoader ---
+    val_loader = DataLoader(
+        dataset=val_dataset,
+        batch_size=batch_size,
+        shuffle=False, # 검증 데이터는 섞을 필요 없음
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True
@@ -283,7 +307,9 @@ def main():
         nlayers=encoder_layers, 
         dim=encoder_dim, 
         nhead=encoder_heads, 
-        ratio=4.0
+        ratio=4.0,
+        dropout=encoder_dropout,
+        droppath=encoder_droppath
     )
 
     predictor = Predictor(
@@ -292,7 +318,8 @@ def main():
         nlayers=predictor_layers, 
         nhead=predictor_heads, 
         ratio=4.0, 
-        max_seq_len=max_seq_len
+        max_seq_len=max_seq_len,
+        droppath=predictor_droppath
     )
 
     w_jepa_model = W_JEPA(
@@ -308,18 +335,19 @@ def main():
     scaler = GradScaler(enabled=use_cuda)
     
     # [수정] 에포크별 평균 손실을 기록할 리스트
-    all_epoch_losses = []
+    all_epoch_train_losses = []
+    all_epoch_val_losses = [] # [추가] 검증 손실 기록
 
     # --- 학습 루프 ---
     print("--- Start Training Loop ---")
     global_step = 0
     for epoch in range(num_epochs):
+        # --- Training Phase ---
         w_jepa_model.train()
-        epoch_loss_meter = AverageMeter() # [수정] 에포크 손실 기록계 초기화
+        epoch_loss_meter = AverageMeter()
         
-        pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}]", dynamic_ncols=True)
+        pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Training", dynamic_ncols=True)
         
-        # [수정] enumerate를 사용하여 배치 인덱스 추적
         for i, (waveforms, lengths) in enumerate(pbar):
             waveforms = waveforms.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
@@ -329,32 +357,54 @@ def main():
                 loss = loss / accumulation_steps
             
             scaler.scale(loss).backward()
+            # loss.item()은 스케일링되지 않은 값을 반환
             epoch_loss_meter.update(loss.item() * accumulation_steps, n=waveforms.size(0))
 
             if (i + 1) % accumulation_steps == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                scheduler.step() # 스케줄러도 optimizer step과 함께 호출
+                scheduler.step()
             
             pbar.set_postfix(loss=f"{epoch_loss_meter.val:.4f}", avg_loss=f"{epoch_loss_meter.avg:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
             global_step += 1
     
-        avg_loss = epoch_loss_meter.avg
-        all_epoch_losses.append(avg_loss) # [수정] 에포크 평균 손실 저장
-        print(f"--- Epoch {epoch+1} Finished, Average Loss: {avg_loss:.4f} ---")
+        avg_train_loss = epoch_loss_meter.avg
+        all_epoch_train_losses.append(avg_train_loss)
+        print(f"--- Epoch {epoch+1} Training Finished, Average Loss: {avg_train_loss:.4f} ---")
+
+        # --- [추가] Validation Phase ---
+        w_jepa_model.eval()
+        val_loss_meter = AverageMeter()
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Validation", dynamic_ncols=True)
+            for waveforms, lengths in val_pbar:
+                waveforms = waveforms.to(device, non_blocking=True)
+                lengths = lengths.to(device, non_blocking=True)
+                
+                with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_cuda):
+                    loss, _, _ = w_jepa_model(waveforms, lengths)
+                
+                val_loss_meter.update(loss.item(), n=waveforms.size(0))
+                val_pbar.set_postfix(val_loss=f"{val_loss_meter.avg:.4f}")
+
+        avg_val_loss = val_loss_meter.avg
+        all_epoch_val_losses.append(avg_val_loss)
+        print(f"--- Epoch {epoch+1} Validation Finished, Average Loss: {avg_val_loss:.4f} ---")
+
 
     print("--- End Training Loop ---")
     
-    # [수정] 모델 저장
-    model_save_path = 'w_jepa_librispeech_bf16_accum.pth'
+    model_save_path = 'w_jepa_librispeech_bf16_accum_with_val.pth'
     torch.save(w_jepa_model.state_dict(), model_save_path)
     print(f"Model saved to {model_save_path}")
 
-    # [수정] 학습 로그를 YAML 파일로 저장
-    log_save_path = 'training_log.yaml'
+    log_save_path = 'training_log_with_val.yaml'
     print(f"Saving training log to {log_save_path}")
-    log_data = {'epoch_average_losses': all_epoch_losses}
+    log_data = {
+        'epoch_average_train_losses': all_epoch_train_losses,
+        'epoch_average_val_losses': all_epoch_val_losses
+        }
     with open(log_save_path, 'w') as f:
         yaml.dump(log_data, f, default_flow_style=False)
     print("Log saved.")

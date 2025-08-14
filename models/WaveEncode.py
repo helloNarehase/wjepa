@@ -8,12 +8,12 @@ from .Block import Block
 from .Feature_Extractor import Feature_Extractor
 
 class WaveEncode(nn.Module):
-    def __init__(self, conv_configs:list[tuple[int, int, int]], nlayers:int, dim:int, nhead:int, ratio:float):
+    def __init__(self, conv_configs:list[tuple[int, int, int]], nlayers:int, dim:int, nhead:int, ratio:float, dropout: float = 0.0, droppath: float = 0.0):
         super().__init__()
-        self.fe = Feature_Extractor(conv_configs)
+        self.fe = Feature_Extractor(conv_configs, dropout=dropout)
         self.embed = nn.Linear(conv_configs[-1][0], dim)
         self.blocks = nn.ModuleList([
-            Block(dim=dim, nhead=nhead, ratio=ratio) for _ in range(nlayers)
+            Block(dim=dim, nhead=nhead, ratio=ratio, droppath=droppath) for _ in range(nlayers)
         ])
         self.ln = nn.LayerNorm(dim)
 

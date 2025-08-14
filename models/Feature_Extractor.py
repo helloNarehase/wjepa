@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class Feature_Extractor(nn.Module):
-    def __init__(self, conv_configs):
+    def __init__(self, conv_configs, dropout: float = 0.0):
         super().__init__()
         self.conv_layers = nn.ModuleList()
         in_channels = 1
@@ -10,7 +10,7 @@ class Feature_Extractor(nn.Module):
             conv_layer = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding=0)
             norm_layer = nn.GroupNorm(num_groups=out_channels, num_channels=out_channels)
             activation = nn.GELU()
-            self.conv_layers.append(nn.Sequential(conv_layer, norm_layer, activation))
+            self.conv_layers.append(nn.Sequential(conv_layer, norm_layer, activation, nn.Dropout(dropout)))
             in_channels = out_channels
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:

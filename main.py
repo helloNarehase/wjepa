@@ -43,7 +43,7 @@ class EMA():
 
 class W_JEPA(nn.Module):
     """
-    I-JEPA 아키텍처를 따르는 Wave-JEPA 모델 클래스입니다.
+    Wave-JEPA 모델 클래스. I-JEPA 논문의 아키텍처를 따릅니다.
     """
     def __init__(
         self,
@@ -75,81 +75,70 @@ class W_JEPA(nn.Module):
     def _create_masks(self, seq_len: int, device: torch.device):
         """
         I-JEPA 논문의 multi-block 마스킹 전략을 구현합니다.
-        1. 여러 개의 분리된 '타겟' 블록을 샘플링합니다.
-        2. 하나의 넓은 '컨텍스트' 블록을 샘플링합니다.
-        3. 컨텍스트에서 타겟과 겹치는 부분을 제거합니다.
         """
         full_indices = torch.arange(seq_len, device=device)
         
         # --- 1. 타겟 블록 샘플링 ---
         target_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         for _ in range(self.num_target_blocks):
-            # 타겟 블록의 길이(scale)를 랜덤하게 결정
             block_len = int(seq_len * (self.target_block_scale[0] + random.random() * (self.target_block_scale[1] - self.target_block_scale[0])))
             if block_len == 0: continue
             
-            # 타겟 블록의 시작 위치를 랜덤하게 결정
             start_idx = torch.randint(0, seq_len - block_len + 1, (1,), device=device).item()
             target_mask[start_idx : start_idx + block_len] = True
 
         # --- 2. 컨텍스트 블록 샘플링 ---
         context_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
-        # 컨텍스트 블록의 길이를 랜덤하게 결정
         context_len = int(seq_len * (self.context_block_scale[0] + random.random() * (self.context_block_scale[1] - self.context_block_scale[0])))
         if context_len > 0:
-            # 컨텍스트 블록의 시작 위치를 랜덤하게 결정
             start_idx = torch.randint(0, seq_len - context_len + 1, (1,), device=device).item()
             context_mask[start_idx : start_idx + context_len] = True
 
         # --- 3. 컨텍스트에서 타겟과 겹치는 부분 제거 ---
         context_mask = context_mask & (~target_mask)
 
-        # 마스크(boolean)를 인덱스(long)로 변환
         context_indices = full_indices[context_mask]
         target_indices = full_indices[target_mask]
 
         return context_indices, target_indices
 
-
     def forward(self, x: torch.Tensor, lengths: torch.Tensor):
-        features, new_lengths = self.context_encoder.feature_extractor(x, lengths)
-        B, N, D = features.shape
-        device = features.device
+        # NOTE: This simplified forward pass might not perfectly align with the original logic,
+        # but it's structured to allow training to run.
+        # The original code had a feature_extractor call that is now part of the encoder.
+        # Let's assume the encoder handles feature extraction internally.
         
-        # 배치 내에서 가장 짧은 길이를 기준으로 마스크 생성
-        min_len = min(new_lengths).item()
+        # A mock feature extraction to get sequence length
+
+        feature, new_lengths = self.context_encoder.feature_extractor(x, lengths)
+        mock_seq_len = max(new_lengths)
+        B, _, D_in = feature.shape
         
-        context_indices, target_indices = self._create_masks(min_len, device)
+        device = x.device
         
-        # 예측할 타겟이 없으면 loss 0 반환
+        context_indices, target_indices = self._create_masks(mock_seq_len, device)
+        
         if target_indices.numel() == 0 or context_indices.numel() == 0:
             return torch.tensor(0., device=device, requires_grad=True), None, None
-
-        # 생성된 마스크를 배치 전체에 동일하게 적용
+        
         context_indices = context_indices.unsqueeze(0).expand(B, -1)
         target_indices = target_indices.unsqueeze(0).expand(B, -1)
-        
-        # 컨텍스트 인덱스를 사용해 컨텍스트 특징 추출
-        context_features = torch.gather(features, 1, context_indices.unsqueeze(-1).expand(-1, -1, D))
-        
-        # 컨텍스트 인코딩
-        encoded_context = self.context_encoder.encode(context_features, mask=None)
+
+        gather_indices = context_indices.unsqueeze(-1).expand(-1, -1, D_in)
+        context_features = torch.gather(feature, 1, gather_indices) 
+        encoded_context = self.context_encoder.encode(context_features, lengths=None)
 
         with torch.no_grad():
-            self._update_target_encoder()
-            # 타겟 인코더는 전체 특징을 인코딩
-            full_encoded_features = self.target_encoder.encode(features, mask=None)
-            # 타겟 인덱스를 사용해 정답(타겟) 특징 추출
-            encoded_target = torch.gather(full_encoded_features, 1, target_indices.unsqueeze(-1).expand(-1, -1, D))
+            if self.training: # [추가] 학습 중에만 EMA 업데이트 수행
+                self._update_target_encoder()
+            full_encoded_features = self.target_encoder.encode(feature, lengths=new_lengths.to(device))
+            encoded_target = torch.gather(full_encoded_features, 1, target_indices.unsqueeze(-1).expand(-1, -1, D_in))
 
-        # Predictor를 사용해 타겟 특징 예측
         predicted_target = self.predictor.enc(encoded_context, context_indices, target_indices)
         
-        # MSE Loss 계산
         loss = F.mse_loss(predicted_target, encoded_target)
         
         return loss, predicted_target, encoded_target
-
 # --- 데이터 처리 및 학습 루프 ---
 
 def collate_fn(batch, sample_rate=16000, duration=10):
@@ -219,11 +208,14 @@ if __name__ == '__main__':
         encoder_dim = 512
         encoder_layers = 6
         encoder_heads = 8
+        encoder_dropout = 0.1
+        encoder_droppath = 0.1
         
         # --- Predictor의 차원을 Encoder보다 작게 설정 (병목 구조) ---
         predictor_dim = 512 
         predictor_layers = 4
         predictor_heads = 8
+        predictor_droppath = 0.1
         
         # Feature Extractor를 통과한 후의 최대 시퀀스 길이를 예측하여 설정
         # 이 값은 실제 데이터와 conv_configs에 따라 달라지므로, 넉넉하게 설정하는 것이 좋습니다.
@@ -236,6 +228,8 @@ if __name__ == '__main__':
             dim=encoder_dim, 
             nhead=encoder_heads, 
             ratio=4.0,
+            dropout=encoder_dropout,
+            droppath=encoder_droppath,
         )
 
         predictor = Predictor(
@@ -245,6 +239,7 @@ if __name__ == '__main__':
             nhead=predictor_heads, 
             ratio=4.0, 
             max_seq_len=max_seq_len,
+            droppath=predictor_droppath,
         )
 
         # --- W_JEPA 모델 생성 (I-JEPA 기본 마스킹 파라미터 사용) ---

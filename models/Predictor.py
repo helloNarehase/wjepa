@@ -7,14 +7,14 @@ from .MLP import MLP
 from .Block import Block
 
 class Predictor(nn.Module):
-    def __init__(self, in_dim:int, dim:int, nlayers:int, nhead:int, ratio:float, max_seq_len:int):
+    def __init__(self, in_dim:int, dim:int, nlayers:int, nhead:int, ratio:float, max_seq_len:int, droppath: float = 0.0):
         super().__init__()
 
         self.embed = nn.Linear(
             in_dim, dim
         )
         self.blocks = nn.ModuleList([
-            Block(dim=dim, nhead=nhead, ratio=ratio) for _ in range(nlayers)
+            Block(dim=dim, nhead=nhead, ratio=ratio, droppath=droppath) for _ in range(nlayers)
         ])
 
         self.mask = nn.Parameter(
