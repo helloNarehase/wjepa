@@ -200,15 +200,39 @@ def collate_fn(batch, sample_rate=16000, duration=10):
 
 
 def get_lr_scheduler(optimizer, max_iter, warmup_iter, final_lr):
+    """
+    Creates a learning rate scheduler with a linear warmup followed by a cosine decay.
+    After max_iter, the learning rate is held constant at final_lr.
+    
+    Args:
+        optimizer (torch.optim.Optimizer): The optimizer for which to schedule the learning rate.
+        max_iter (int): The total number of iterations for training decay.
+        warmup_iter (int): The number of iterations for the linear warmup phase.
+        final_lr (float): The final learning rate after decay.
+        
+    Returns:
+        torch.optim.lr_scheduler.LambdaLR: The learning rate scheduler.
+    """
+    # The base learning rate is fetched from the optimizer's parameter groups.
     base_lr = optimizer.param_groups[0]['lr']
     
+    # This is the lambda function that will calculate the learning rate multiplier for each step.
     def lr_lambda(current_iter):
+        # During the warmup phase, the learning rate increases linearly.
         if current_iter < warmup_iter:
             return float(current_iter) / float(max(1, warmup_iter))
+        # If the current iteration has reached or passed max_iter, hold the final learning rate.
+        elif current_iter >= max_iter:
+            return final_lr / base_lr
+        # After the warmup and before max_iter, the learning rate follows a cosine decay schedule.
         else:
+            # Calculate the progress of the decay phase (from 0.0 to 1.0).
             progress = float(current_iter - warmup_iter) / float(max(1, max_iter - warmup_iter))
+            # Apply the cosine decay formula.
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Scale the learning rate between the base_lr and final_lr.
             scaled_lr = final_lr + (base_lr - final_lr) * cosine_decay
+            # Return the multiplier relative to the base_lr.
             return scaled_lr / base_lr
 
     return LambdaLR(optimizer, lr_lambda)
@@ -221,9 +245,8 @@ def main():
 
     batch_size = 64
     base_learning_rate = 3e-4
-    final_learning_rate = 1e-8
+    final_learning_rate = 1e-9
     num_epochs = 30
-    warmup_iter = 2000
     accumulation_steps = 8
 
     # --- 모델 하이퍼파라미터 설정 ---
@@ -234,13 +257,13 @@ def main():
     encoder_dim = 512
     encoder_layers = 6
     encoder_heads = 8
-    encoder_dropout = 0.1
-    encoder_droppath = 0.1
+    encoder_dropout = 0.3
+    encoder_droppath = 0.3
     
     predictor_dim = 512
     predictor_layers = 4
     predictor_heads = 8
-    predictor_droppath = 0.1
+    predictor_droppath = 0.3
     
     max_seq_len = 10_000 # Predictor의 pos_embedding 크기와 관련
 
@@ -329,8 +352,8 @@ def main():
     
     optimizer = torch.optim.AdamW(w_jepa_model.parameters(), lr=base_learning_rate, weight_decay=0.02)
     
-    max_iter = len(train_loader) * num_epochs
-    scheduler = get_lr_scheduler(optimizer, max_iter, warmup_iter, final_learning_rate)
+    max_iter = len(train_loader) // accumulation_steps * num_epochs
+    scheduler = get_lr_scheduler(optimizer, max_iter, int(max_iter * 0.3), final_learning_rate)
     
     scaler = GradScaler(enabled=use_cuda)
     
