@@ -75,7 +75,7 @@ def apply_masks(features: torch.Tensor, full_masks: List[torch.Tensor]) -> Tuple
     # Transpose back to (B, n_mels, T_padded)
     dropped_padded_features = padded_transposed.transpose(1, 2)
     
-    return dropped_padded_features, torch.tensor(unmasked_lengths, dtype=torch.long)
+    return dropped_padded_features, torch.tensor(unmasked_lengths, dtype=torch.long, device=features.device)
 
 class Predictor(nn.Module):
     def __init__(self, in_dim:int, dim:int, nlayers:int, nhead:int, ratio:float, max_seq_len:int, droppath: float = 0.0):
@@ -103,100 +103,46 @@ class Predictor(nn.Module):
     def forward(self, ctx_feature:torch.Tensor, length:int, ctx_mask:torch.Tensor, tgt_mask:torch.Tensor):
         B, _, _ = ctx_feature.shape
         _, M, N_tgt = tgt_mask.shape
-        N_ctx = length
+        N_ctx_total = length
 
         # ctx
-        pos_embed = self.pos_embed.expand(len(ctx_mask), -1, -1)[:, :N_ctx, :]
+        pos_embed = self.pos_embed.expand(B, -1, -1)[:, :N_ctx_total, :]
         pos_embed, _lengths = apply_masks(pos_embed.permute(0, 2, 1), ctx_mask)
-        print(ctx_feature.shape, pos_embed.shape)
         ctx_feature += pos_embed
+        
         ctx_feature = torch.repeat_interleave(
-            ctx_feature[:, None, :, :].permute(0, 1, 3, 2), 
-            repeats=torch.tensor(M), 
+            ctx_feature.permute(0, 2, 1)[:, None, :, :],
+            repeats=M,
             dim=1
         )
-        ctx_feature = ctx_feature.view(B * M, max(_lengths), -1)
+        ctx_feature = ctx_feature.view(B * M, _lengths.max().item(), -1)
 
         # tgt
-        pos_embed = self.pos_embed.expand(B * M, -1, -1)[:, :N_ctx, :]
-        tgt_pos_embed = create_span_targets(
-            pos_embed.permute(0, 2, 1), tgt_mask
-        )
-
-        tgt_masks = self.mask.expand(B, N_tgt, -1)
-        tgt_masks = torch.repeat_interleave(
-            tgt_masks[:, None, :, :],
-            repeats=torch.tensor(M), 
-            dim=1
-        )
-        tgt_masks += tgt_pos_embed
+        pos_embed_base_repeated = self.pos_embed.expand(B, -1, -1)[:, :N_ctx_total, :].repeat_interleave(M, dim=0)
+        tgt_mask_reshaped = tgt_mask.view(B * M, 1, N_tgt)
         
-        tgt_masks = tgt_masks.view(B * M, N_tgt, -1)
+        tgt_pos_embed = create_span_targets(
+            pos_embed_base_repeated.permute(0, 2, 1), tgt_mask_reshaped
+        )
+        tgt_pos_embed = tgt_pos_embed.squeeze(1)
 
+        tgt_masks = self.mask.expand(B * M, N_tgt, -1)
+        tgt_masks = tgt_masks + tgt_pos_embed
+        
         # attention-mask (padding mask)
         N_ctx = _lengths.max()
-        attention_mask = (torch.arange(_lengths.max()+N_tgt)[None, :] < _lengths[:, None])
-        attention_mask[..., -N_tgt:] = True
+        attention_mask = (torch.arange(N_ctx + N_tgt, device=_lengths.device)[None, :] < _lengths[:, None])
         attention_mask = torch.repeat_interleave(
             attention_mask,
-            repeats=torch.tensor(M), 
+            repeats=M, 
             dim=0
         )
-
+        attention_mask[..., -N_tgt:] = True
 
         # forward
-        h = torch.concat([self.embed(ctx_feature), tgt_masks], dim= 1)
+        h = torch.cat([self.embed(ctx_feature), tgt_masks], dim=1)
         for block in self.blocks:
-            # print(h.shape, attention_mask.shape)
             h, _ = block(h, attention_mask)
         h = self.ln(h)
 
-        # print(.shape)
-        return h[:, N_ctx:, :]
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        B, N_ctx, _ = feature.shape
-        N_tgt = tgt_mask.shape[1]
-        D = self.pos_embed.shape[-1]
-
-        # 1. embed context tokens
-        feature = self.embed(feature)
-
-        # 2. create mask tokens
-        mask_tokens = self.mask.expand(B, N_tgt, -1)
-        pos_embed = self.pos_embed.expand(B, -1, -1)
-
-        context_pos = apply_masks(
-            pos_embed, ctx_mask
-        )
-        target_pos = apply_masks(
-            pos_embed, tgt_mask
-        )
-        feature = feature + context_pos
-        
-        mask_tokens = mask_tokens + target_pos
-
-        # 5. concatenate context and target tokens
-        predictor_input = torch.cat([feature, mask_tokens], dim=1)
-
-        # 6. pass through transformer blocks
-        h = self.encode(predictor_input, mask=None)
-
-        # 7. return predictions for target tokens
-        pred = h[:, N_ctx:]
-        return pred
-    
-    # def forward(self, x:torch.Tensor, mask:torch.Tensor|None):
-    #     x = self.embed(x)
-    #     h = self.encode(x, mask)
-    #     return h
+        return h[:, -N_tgt:, :]

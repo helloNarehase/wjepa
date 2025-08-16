@@ -43,8 +43,8 @@ class AverageMeter:
     def update(self, val, n=1):
         self.val = val
         self.sum += val * n
-        if self.count > 0:
-            self.avg = self.sum / self.count
+        self.count += n
+        self.avg = self.sum / self.count
         self.history.append(val)
 
 
@@ -286,7 +286,7 @@ class W_JEPA(nn.Module):
         with torch.no_grad():
             target_encoder.eval()
             full_encoded_features = target_encoder.encode(features.permute(0, 2, 1).detach(), lengths=new_lengths.to(x.device))
-            tgt_features = create_span_targets(full_encoded_features.permute(0, 2, 1), tgt_mask).detach()
+            tgt_features = create_span_targets(full_encoded_features.permute(0, 2, 1), tgt_mask)
 
         # 4. Prediction
         ctx_pred = self.predictor(
@@ -297,9 +297,10 @@ class W_JEPA(nn.Module):
         )
 
         # 5. Loss Calculation
-        if ctx_pred.numel() == 0 or tgt_features.numel() == 0:
+        if tgt_features is None or ctx_pred.numel() == 0 or tgt_features.numel() == 0:
             return torch.tensor(0., device=x.device, requires_grad=True)
 
+        tgt_features = tgt_features.detach()
         B, M, S, D = tgt_features.shape
         loss = F.l1_loss(ctx_pred, tgt_features.reshape(B * M, S, D))
         
