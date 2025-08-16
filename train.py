@@ -14,7 +14,7 @@ import numpy as np
 from typing import List, Tuple, Optional, Callable
 
 
-from torchaudio import load
+from torchcodec.decoders import AudioDecoder
 from torchaudio.functional import resample
 from os import listdir
 from os.path import join
@@ -337,7 +337,16 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         filepath = self.filepaths[idx]
         try:
-            audio_tensor, sampling_rate = load(filepath)
+            codec = AudioDecoder(filepath)
+            audio_tensor, _, _, sampling_rate = codec.get_all_samples()
+            """
+            AudioSamples:
+                data (shape): torch.Size([2, 4297722])
+                pts_seconds: 0.02505668934240363
+                duration_seconds: 97.45401360544217
+                sample_rate: 44100
+
+            """
         except Exception as e:
             print(f"Warning: Error loading file {filepath}: {e}")
             # Return a dummy tensor that will be filtered by collate_fn
