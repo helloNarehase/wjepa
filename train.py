@@ -3,7 +3,7 @@ from torch import nn, einsum
 from torch.nn import functional as F
 import copy
 import torchaudio
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, ConcatDataset, random_split
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import math
@@ -12,6 +12,7 @@ import warnings
 import yaml
 import numpy as np
 from typing import List, Tuple, Optional, Callable
+import gc # 가비지 컬렉터 임포트
 
 
 from torchcodec.decoders import AudioDecoder
@@ -21,6 +22,7 @@ from os.path import join
 from pathlib import Path
 
 from torch.amp import autocast, GradScaler
+# Assuming 'models.py' exists in the same directory with WaveEncode, Predictor, etc.
 from models import WaveEncode, Predictor, apply_masks, create_span_targets
 
 
@@ -56,8 +58,8 @@ def update_moving_average(ema_updater, ma_model, current_model):
     Exponential Moving Average(EMA)를 사용하여 모델의 가중치를 업데이트합니다.
     """
     for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-        old_weight, up_weight = ma_params.data, current_params.data
-        ma_params.data = ema_updater.update_average(old_weight, up_weight)
+        # Use in-place copy_ to update the moving average tensor
+        ma_params.copy_(ema_updater.update_average(ma_params, current_params))
 
 class EMA():
     """
@@ -74,7 +76,7 @@ class EMA():
 
 # --- 데이터 처리 및 학습 루프 ---
 
-def base_collate_fn(batch, sample_rate=16000, duration=10, min_duration_ms=200):
+def base_collate_fn(batch, sample_rate=16000, duration=12, min_duration_ms=200):
     target_len = sample_rate * duration
     min_len = sample_rate * min_duration_ms // 1000
     waveforms, lengths = [], []
@@ -121,12 +123,14 @@ class MaskCollator(object):
         span: int = 4,
         mask_ratio: float = 0.6,
         sample_rate: int = 16000,
+        max_target_spans: int | None = None,  # 새로 추가된 하이퍼파라미터
         **collate_kwargs
     ):
         self.default_collate = default_collate
         self.span = span
         self.mask_ratio = mask_ratio
         self.sample_rate = sample_rate
+        self.max_target_spans = max_target_spans  # 최대 target span 개수 제한
         self.collate_kwargs = collate_kwargs
         self.conv_configs = conv_configs
 
@@ -139,8 +143,13 @@ class MaskCollator(object):
 
     def __call__(self, batch):
         """
-        Processes a batch of audio, creates a SHARED mask for all samples, 
-        and returns data in the specified format.
+        Processes a batch of audio, creates masks, and returns data in the specified format.
+        
+        Returns:
+            Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]], Optional[torch.Tensor]]:
+            - waveforms: (B, 1, T_audio)
+            - full_mask: List of B tensors, each with indices of frames to be masked.
+            - target_mask: (B, N, S) tensor with indices of spans for the reconstruction target.
         """
         result = self.default_collate(batch, **self.collate_kwargs)
         
@@ -148,34 +157,62 @@ class MaskCollator(object):
             return None, None, None, None
         
         waveforms, lengths = result
-        B = waveforms.shape[0]
         _lengths = self._get_feat_extract_output_lengths(lengths)
+        frame_lengths = _lengths.tolist()
         
-        # Use the length of the first sample as a reference to generate a shared mask
-        ref_length = _lengths[0].item()
-
-        # 1. Create one shared mask based on the reference length
-        shared_full_mask = self._create_full_masks([ref_length], self.span, self.mask_ratio)[0]
+        full_masks_lists, extracted_spans_np = self.create_mask_indices_with_extraction(
+            frame_lengths, self.span, self.mask_ratio
+        )
         
-        # 2. Extract target spans from this shared mask
-        target_spans = self._extract_spans_from_mask(shared_full_mask, self.span)
-        N = len(target_spans)
-
-        # 3. The context mask (ctx_mask) is now the same for all samples.
-        #    It's defined by the indices of the target spans.
-        ctx_mask_indices = sorted(list(set(idx for span in target_spans for idx in span)))
-        ctx_mask_tensor = torch.tensor(ctx_mask_indices, dtype=torch.long)
-        ctx_mask = [ctx_mask_tensor] * B
-
-        # 4. Create the target_mask tensor by replicating the shared spans
-        if N > 0:
-            target_spans_np = np.array(target_spans, dtype=int)
-            # Create a (1, N, S) tensor and expand it to (B, N, S)
-            target_mask = torch.from_numpy(target_spans_np).unsqueeze(0).expand(B, -1, -1)
+        # Convert full_masks to a list of torch.Tensors
+        full_mask = [torch.tensor(mask, dtype=torch.long) for mask in full_masks_lists]
+        
+        # Convert extracted_spans numpy array to a torch.Tensor
+        if extracted_spans_np.size > 0:
+            target_mask = torch.from_numpy(extracted_spans_np)
         else:
+            # Create an empty tensor if no spans were extracted
+            B = len(_lengths)
             target_mask = torch.empty((B, 0, self.span), dtype=torch.long)
             
-        return waveforms, lengths, ctx_mask, target_mask
+        return waveforms, lengths, full_mask, target_mask
+    
+    def create_mask_indices_with_extraction(self, lengths: List[int], span: int, mask_ratio: float) -> Tuple[List[List[int]], np.ndarray]:
+        if not lengths:
+            return [], np.array([])
+        
+        full_masks = self._create_full_masks(lengths, span, mask_ratio)
+        
+        all_spans = []
+        min_num_spans = float('inf')
+        
+        for mask_indices in full_masks:
+            spans = self._extract_spans_from_mask(mask_indices, span)
+            all_spans.append(spans)
+            min_num_spans = min(min_num_spans, len(spans))
+        
+        if min_num_spans == float('inf'):
+            min_num_spans = 0
+        
+        # max_target_spans 제한 적용
+        N = int(min_num_spans)
+        if self.max_target_spans is not None:
+            N = min(N, self.max_target_spans)
+        
+        B = len(lengths)
+        
+        if N == 0:
+            return full_masks, np.array([])
+        
+        extracted_spans = np.full((B, N, span), -1, dtype=int)
+        
+        for b, spans in enumerate(all_spans):
+            selected_spans = random.sample(spans, N) if len(spans) >= N else spans
+            for n, span_indices in enumerate(selected_spans):
+                for s, idx in enumerate(span_indices):
+                    extracted_spans[b, n, s] = idx
+        
+        return full_masks, extracted_spans
     
     def _create_full_masks(self, lengths: List[int], span: int, mask_ratio: float) -> List[List[int]]:
         result = []
@@ -274,12 +311,12 @@ class W_JEPA(nn.Module):
         # 5. Loss Calculation
         tgt_features = tgt_features.detach()
         B, M, S, D = tgt_features.shape
-        loss = F.l1_loss(ctx_pred, tgt_features.reshape(B * M, S, D))
+        loss = F.mse_loss(ctx_pred, tgt_features.reshape(B * M, S, D))
         
         return loss
 
 class AudioDataset(Dataset):
-    def __init__(self, root_dir='./ganyu', target_sampling_rate=16000, min_duration_sec=5.0):
+    def __init__(self, root_dir='./ganyu', target_sampling_rate=16000, min_duration_sec=0.5):
         self.root_dir = root_dir
         self.target_sampling_rate = target_sampling_rate
         
@@ -295,7 +332,7 @@ class AudioDataset(Dataset):
             try:
                 info = torchaudio.info(filepath)
                 duration = info.num_frames / info.sample_rate
-                if duration >= min_duration_sec:
+                if duration > min_duration_sec:
                     self.filepaths.append(filepath)
             except Exception as e:
                 print(f"Warning: Could not read info for {filepath}, skipping. Error: {e}")
@@ -310,14 +347,6 @@ class AudioDataset(Dataset):
         try:
             codec = AudioDecoder(filepath)
             audio_tensor, _, _, sampling_rate = codec.get_all_samples()
-            """
-            AudioSamples:
-                data (shape): torch.Size([2, 4297722])
-                pts_seconds: 0.02505668934240363
-                duration_seconds: 97.45401360544217
-                sample_rate: 44100
-
-            """
         except Exception as e:
             print(f"Warning: Error loading file {filepath}: {e}")
             # Return a dummy tensor that will be filtered by collate_fn
@@ -330,14 +359,13 @@ class AudioDataset(Dataset):
                 new_freq=self.target_sampling_rate
             )
 
-        return audio_tensor, sampling_rate, None, None, None, None
+        return audio_tensor, self.target_sampling_rate, None, None, None, None
 
 def get_lr_scheduler(optimizer, max_iter, warmup_iter, final_lr):
     base_lr = optimizer.param_groups[0]['lr']
     def lr_lambda(current_iter):
         if current_iter < warmup_iter:
-            # Use current_iter + 1 for warmup to avoid LR=0 at the very start
-            return float(current_iter + 1) / float(max(1, warmup_iter))
+            return float(current_iter) / float(max(1, warmup_iter))
         elif current_iter >= max_iter:
             return final_lr / base_lr
         else:
@@ -353,11 +381,17 @@ def main():
     use_cuda = torch.cuda.is_available()
     print(f"Using device: {device}")
 
-    batch_size = 32
+    # --- 메모리 최적화 ---
+    # GPU 메모리 부족 문제를 해결하기 위해 배치 크기를 줄이고, 
+    # 유효 배치 크기(effective batch size)를 유지하기 위해 축적 단계를 늘립니다.
+    # 기존: batch_size=16, accumulation_steps=16 (유효 배치 크기: 256)
+    # 변경: batch_size=8, accumulation_steps=32 (유효 배치 크기: 256)
+    batch_size = 16
+    accumulation_steps = 16
+    
     base_learning_rate = 3e-4
-    final_learning_rate = 1e-9
-    num_epochs = 30
-    accumulation_steps = 8
+    final_learning_rate = 1e-8
+    num_epochs = 10
     ema_decay = 0.996
 
     # --- 모델 하이퍼파라미터 설정 ---
@@ -367,22 +401,39 @@ def main():
     ]
     encoder_dim = 512
     encoder_layers = 6
-    encoder_heads = 8
+    encoder_heads = 16
     encoder_dropout = 0.3
-    encoder_droppath = 0.3
+    encoder_droppath = 0.1
     
     predictor_dim = 512
-    predictor_layers = 4
-    predictor_heads = 8
-    predictor_droppath = 0.3
+    predictor_layers = 3
+    predictor_heads = 16
+    predictor_droppath = 0.0
     
     max_seq_len = 10_000
 
     # --- 데이터셋 및 DataLoader 준비 ---
     print("Loading dataset...")
-    full_dataset = AudioDataset(min_duration_sec=5.0)
+    root_dir = "data/"
+    try:
+        train_clean_100 = torchaudio.datasets.LIBRISPEECH(
+            root=root_dir,
+            url='train-clean-100',
+            download=True
+        )
+    except Exception as e:
+        print(f"Could not download or load LibriSpeech, continuing with local data only. Error: {e}")
+        train_clean_100 = []
+
+
+    # full_dataset = ConcatDataset([AudioDataset(root_dir="ganyu")])
+    full_dataset = ConcatDataset([train_clean_100, AudioDataset(root_dir="ganyu")])
 
     dataset_size = len(full_dataset)
+    if dataset_size == 0:
+        print("No data found. Exiting.")
+        return
+        
     val_size = int(0.2 * dataset_size)
     train_size = dataset_size - val_size
     print(f"Splitting dataset: {train_size} for training, {val_size} for validation.")
@@ -394,14 +445,14 @@ def main():
         conv_configs=conv_configs,
         span=4,
         mask_ratio=0.65,
-        sample_rate=16000
+        sample_rate=16000,
+        max_target_spans=12,
     )
 
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, collate_fn=mask_collator, num_workers=4, pin_memory=True)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=False, collate_fn=mask_collator, num_workers=4, pin_memory=True)
     
     # --- 모델 초기화 ---
-    # 1. 온라인 네트워크(Context Encoder)와 Predictor 초기화
     context_encoder = WaveEncode(
         conv_configs=conv_configs, nlayers=encoder_layers, dim=encoder_dim, 
         nhead=encoder_heads, ratio=4.0, dropout=encoder_dropout, droppath=encoder_droppath
@@ -412,18 +463,14 @@ def main():
         nhead=predictor_heads, ratio=4.0, max_seq_len=max_seq_len, droppath=predictor_droppath
     ).to(device)
 
-    # W_JEPA 모델은 온라인 네트워크(Context Encoder)와 Predictor를 래핑합니다.
     w_jepa_model = W_JEPA(encoder=context_encoder, predictor=predictor).to(device)
 
-    # 2. 타겟 네트워크(Target Encoder)를 온라인 네트워크의 복사본으로 초기화
     target_encoder = copy.deepcopy(context_encoder).to(device)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
-    # 3. EMA 업데이터 초기화
     ema_updater = EMA(beta=ema_decay)
     
-    # 옵티마이저는 온라인 네트워크의 파라미터만 최적화합니다.
     optimizer = torch.optim.AdamW(w_jepa_model.parameters(), lr=base_learning_rate, weight_decay=0.02)
     
     max_iter = len(train_loader) // accumulation_steps * num_epochs
@@ -443,34 +490,44 @@ def main():
         
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Training", dynamic_ncols=True)
         
+        optimizer.zero_grad() 
         for i, batch_data in enumerate(pbar):
             if batch_data[0] is None: continue
             
             waveforms, lengths, ctx_mask, tgt_mask = batch_data
+            
             waveforms = waveforms.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
             ctx_mask = [m.to(device, non_blocking=True) for m in ctx_mask]
             tgt_mask = tgt_mask.to(device, non_blocking=True)
             
             with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_cuda):
-                # Target Encoder는 forward pass에 인자로 전달됩니다.
                 loss = w_jepa_model(waveforms, lengths, ctx_mask, tgt_mask, target_encoder)
                 if loss.requires_grad:
                     loss = loss / accumulation_steps
             
             if loss.requires_grad:
                 scaler.scale(loss).backward()
-                epoch_loss_meter.update(loss.item() * accumulation_steps, n=waveforms.size(0))
+                loss_val = loss.item() * accumulation_steps
+                epoch_loss_meter.update(loss_val, n=waveforms.size(0))
+                del loss, loss_val
 
-            if (i + 1) % accumulation_steps == 0:
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                 scaler.step(optimizer)
                 scaler.update()
-                # EMA 업데이트를 명시적으로 호출합니다.
                 update_moving_average(ema_updater, target_encoder, w_jepa_model.context_encoder)
                 optimizer.zero_grad()
                 scheduler.step()
             
             pbar.set_postfix(loss=f"{epoch_loss_meter.val:.4f}", avg_loss=f"{epoch_loss_meter.avg:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+
+            # --- 메모리 정리 ---
+            # 사용한 텐서를 명시적으로 삭제
+            del waveforms, lengths, ctx_mask, tgt_mask
+            # 가비지 컬렉션 및 CUDA 캐시 비우기
+            gc.collect()
+            if use_cuda:
+                torch.cuda.empty_cache()
     
         avg_train_loss = epoch_loss_meter.avg
         all_epoch_train_losses.append(avg_train_loss)
@@ -479,7 +536,7 @@ def main():
         # --- Validation Phase ---
         w_jepa_model.eval()
         val_loss_meter = AverageMeter()
-        with torch.no_grad():
+        with torch.inference_mode():
             val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Validation", dynamic_ncols=True)
             for batch_data in val_pbar:
                 if batch_data[0] is None: continue
@@ -496,14 +553,18 @@ def main():
                 val_loss_meter.update(loss.item(), n=waveforms.size(0))
                 val_pbar.set_postfix(val_loss=f"{val_loss_meter.avg:.4f}")
 
+                # --- 메모리 정리 ---
+                del waveforms, lengths, ctx_mask, tgt_mask, loss
+                gc.collect()
+                if use_cuda:
+                    torch.cuda.empty_cache()
+
         avg_val_loss = val_loss_meter.avg
         all_epoch_val_losses.append(avg_val_loss)
         print(f"--- Epoch {epoch+1} Validation Finished, Average Loss: {avg_val_loss:.4f} ---")
 
     print("--- End Training Loop ---")
     
-    # 모델 저장 시 온라인 네트워크(w_jepa_model)만 저장해도 충분합니다.
-    # 필요 시 target_encoder도 별도로 저장할 수 있습니다.
     model_save_path = 'w_jepa_online_network_final.pth'
     torch.save(w_jepa_model.state_dict(), model_save_path)
     print(f"Online model saved to {model_save_path}")
@@ -520,4 +581,11 @@ def main():
 
 
 if __name__ == '__main__':
+    # It's good practice to add a check for the models file.
+    try:
+        from models import WaveEncode, Predictor, apply_masks, create_span_targets
+    except ImportError:
+        print("Error: 'models.py' not found.")
+        print("Please ensure 'models.py' containing WaveEncode, Predictor, etc. is in the same directory.")
+        exit()
     main()

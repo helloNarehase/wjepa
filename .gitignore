@@ -16,4 +16,6 @@ data/**
 *.png
 *.wav
 *.yaml
-ganyu/
+*.pth
+
+ganyu/**
