@@ -288,6 +288,10 @@ class W_JEPA(nn.Module):
             full_encoded_features = target_encoder.encode(features.permute(0, 2, 1).detach(), lengths=new_lengths.to(x.device))
             tgt_features = create_span_targets(full_encoded_features.permute(0, 2, 1), tgt_mask)
 
+        # If there are no targets, we can't compute a loss. Return 0.
+        if tgt_features is None:
+            return torch.tensor(0., device=x.device, requires_grad=True)
+
         # 4. Prediction
         ctx_pred = self.predictor(
             ctx_feature=encoded_context.permute(0, 2, 1),
@@ -297,9 +301,6 @@ class W_JEPA(nn.Module):
         )
 
         # 5. Loss Calculation
-        if tgt_features is None or ctx_pred.numel() == 0 or tgt_features.numel() == 0:
-            return torch.tensor(0., device=x.device, requires_grad=True)
-
         tgt_features = tgt_features.detach()
         B, M, S, D = tgt_features.shape
         loss = F.l1_loss(ctx_pred, tgt_features.reshape(B * M, S, D))
@@ -307,14 +308,28 @@ class W_JEPA(nn.Module):
         return loss
 
 class AudioDataset(Dataset):
-    def __init__(self, root_dir='./ganyu', target_sampling_rate=16000):
+    def __init__(self, root_dir='./ganyu', target_sampling_rate=16000, min_duration_sec=5.0):
         self.root_dir = root_dir
         self.target_sampling_rate = target_sampling_rate
-        self.filepaths = [
+        
+        all_filepaths = [
             join(root_dir, filename)
             for filename in listdir(root_dir)
             if filename.endswith(".wav")
         ]
+        
+        self.filepaths = []
+        print("Scanning dataset and filtering by duration...")
+        for filepath in tqdm(all_filepaths, desc="Filtering audio files"):
+            try:
+                info = torchaudio.info(filepath)
+                duration = info.num_frames / info.sample_rate
+                if duration >= min_duration_sec:
+                    self.filepaths.append(filepath)
+            except Exception as e:
+                print(f"Warning: Could not read info for {filepath}, skipping. Error: {e}")
+
+        print(f"Finished filtering. Found {len(all_filepaths)} total files, kept {len(self.filepaths)} files >= {min_duration_sec}s.")
 
     def __len__(self):
         return len(self.filepaths)
@@ -324,8 +339,9 @@ class AudioDataset(Dataset):
         try:
             audio_tensor, sampling_rate = load(filepath)
         except Exception as e:
-            print(f"Error loading file {filepath}: {e}")
-            return torch.zeros(1, self.target_sampling_rate), self.target_sampling_rate, None, None, None, None
+            print(f"Warning: Error loading file {filepath}: {e}")
+            # Return a dummy tensor that will be filtered by collate_fn
+            return torch.zeros(1, 1), self.target_sampling_rate, None, None, None, None
 
         if sampling_rate != self.target_sampling_rate:
             audio_tensor = resample(
@@ -383,7 +399,7 @@ def main():
 
     # --- 데이터셋 및 DataLoader 준비 ---
     print("Loading dataset...")
-    full_dataset = AudioDataset()
+    full_dataset = AudioDataset(min_duration_sec=5.0)
 
     dataset_size = len(full_dataset)
     val_size = int(0.2 * dataset_size)
