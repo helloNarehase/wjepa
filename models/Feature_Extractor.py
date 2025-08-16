@@ -28,6 +28,5 @@ class Feature_Extractor(nn.Module):
         for layer in self.conv_layers:
             x = layer(x)
         new_lengths = self._get_feat_extract_output_lengths(lengths.clone())
-        print(f"========{new_lengths}=======")
         return x, new_lengths
 

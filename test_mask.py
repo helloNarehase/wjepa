@@ -9,7 +9,7 @@ import numpy as np
 from typing import List, Tuple, Optional, Callable
 import os
 from pathlib import Path
-from models import Feature_Extractor, Predictor, apply_masks, create_span_targets
+from models import WaveEncode, Predictor, apply_masks, create_span_targets
 
 # ====== Dataset Definition ======
 class AudioDataset(Dataset):
@@ -273,6 +273,7 @@ def create_sample_dataset():
 
 
 def main():
+    import copy
     print("=== Refactored Audio Masking Pipeline Demo ===\n")
     
     # 1. Create dataset and dataloader
@@ -287,7 +288,17 @@ def main():
     mask_collator = MaskCollator(conv_configs, span=SPAN, mask_ratio=0.65, sample_rate=16000)
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=mask_collator)
     
-    feature_extractor = Feature_Extractor(conv_configs=conv_configs)
+    wave_encode = WaveEncode(
+        conv_configs=conv_configs,
+        nlayers     =2,
+        dim         =512,
+        nhead       =32,
+        ratio       =4.0,
+        dropout     =0.3,
+        droppath    =0.1
+    )
+    target_encode = copy.deepcopy(wave_encode.blocks).eval()
+
     predictor         = Predictor(512, 512, 1, 32, 3.0, 1024, 0)
     
     # 3. Process a batch
@@ -300,27 +311,26 @@ def main():
         
     waveforms, lengths, ctx_mask, tgt_mask = batch_data
     
-    print(f"  Waveforms shape: {waveforms.shape} | {lengths}")
-    
     # Extract features from original audio
-    with torch.no_grad():
-        features, new_lengths = feature_extractor(waveforms, lengths)
-        print(f"  Original features shape: {features.shape} | {new_lengths} | {lengths}")
+    features, new_lengths = wave_encode.feature_extractor(waveforms, lengths)
+    
+    # ctx
+    ctx_feature, _lengths = apply_masks(features, ctx_mask)
+    ctx_feature = wave_encode.encode(ctx_feature.permute(0, 2, 1), _lengths)
 
-    span_targets = create_span_targets(features, tgt_mask)
+    with torch.no_grad():
+        ctx_feature
+        tgt_features = target_encode(features.permute(0, 2, 1), new_lengths)
+        tgt_features = create_span_targets(tgt_features.permute(0, 2, 1), tgt_mask)
 
     ctx_pred = predictor(
-        feature = features, 
-        lengths = new_lengths, 
-        ctx_mask = ctx_mask, 
-        tgt_mask = tgt_mask,
+        ctx_feature = ctx_feature.permute(0, 2, 1),
+        length      = features.size(2),
+        ctx_mask= ctx_mask, tgt_mask= tgt_mask
     )
 
-    B, M, S, D = span_targets.shape
-    
-    print(ctx_pred.shape, span_targets.reshape(B * M, S, D).shape)
-
-    loss = F.l1_loss(ctx_pred, span_targets.reshape(B * M, S, D))
+    B, M, S, D = tgt_features.shape
+    loss = F.l1_loss(ctx_pred, tgt_features.reshape(B * M, S, D))
     print(loss)
     return
 

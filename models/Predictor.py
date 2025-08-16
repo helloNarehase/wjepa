@@ -100,18 +100,16 @@ class Predictor(nn.Module):
         )
         self.ln = nn.LayerNorm(dim)
 
-    def forward(self, feature:torch.Tensor, lengths:torch.Tensor, ctx_mask:torch.Tensor, tgt_mask:torch.Tensor):
-        feature = feature[..., :lengths.max()]
-        B, _, N_ctx = feature.shape
+    def forward(self, ctx_feature:torch.Tensor, length:int, ctx_mask:torch.Tensor, tgt_mask:torch.Tensor):
+        B, _, _ = ctx_feature.shape
         _, M, N_tgt = tgt_mask.shape
+        N_ctx = length
 
         # ctx
         pos_embed = self.pos_embed.expand(len(ctx_mask), -1, -1)[:, :N_ctx, :]
-        pos_embed, _ = apply_masks(pos_embed.permute(0, 2, 1), ctx_mask)
-        ctx_feature, _lengths = apply_masks(feature, ctx_mask)
-
+        pos_embed, _lengths = apply_masks(pos_embed.permute(0, 2, 1), ctx_mask)
+        print(ctx_feature.shape, pos_embed.shape)
         ctx_feature += pos_embed
-
         ctx_feature = torch.repeat_interleave(
             ctx_feature[:, None, :, :].permute(0, 1, 3, 2), 
             repeats=torch.tensor(M), 
