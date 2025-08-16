@@ -365,7 +365,8 @@ def get_lr_scheduler(optimizer, max_iter, warmup_iter, final_lr):
     base_lr = optimizer.param_groups[0]['lr']
     def lr_lambda(current_iter):
         if current_iter < warmup_iter:
-            return float(current_iter) / float(max(1, warmup_iter))
+            # Use current_iter + 1 for warmup to avoid LR=0 at the very start
+            return float(current_iter + 1) / float(max(1, warmup_iter))
         elif current_iter >= max_iter:
             return final_lr / base_lr
         else:
