@@ -115,11 +115,11 @@ class Predictor(nn.Module):
             repeats=M,
             dim=1
         )
-        ctx_feature = ctx_feature.view(B * M, _lengths.max().item(), -1)
+        ctx_feature = ctx_feature.reshape(B * M, _lengths.max().item(), -1)
 
         # tgt
         pos_embed_base_repeated = self.pos_embed.expand(B, -1, -1)[:, :N_ctx_total, :].repeat_interleave(M, dim=0)
-        tgt_mask_reshaped = tgt_mask.view(B * M, 1, N_tgt)
+        tgt_mask_reshaped = tgt_mask.reshape(B * M, 1, N_tgt)
         
         tgt_pos_embed = create_span_targets(
             pos_embed_base_repeated.permute(0, 2, 1), tgt_mask_reshaped

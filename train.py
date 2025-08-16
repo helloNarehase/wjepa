@@ -56,8 +56,8 @@ def update_moving_average(ema_updater, ma_model, current_model):
     Exponential Moving Average(EMA)를 사용하여 모델의 가중치를 업데이트합니다.
     """
     for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-        old_weight, up_weight = ma_params.data, current_params.data
-        ma_params.data = ema_updater.update_average(old_weight, up_weight)
+        # Use in-place copy_ to update the moving average tensor
+        ma_params.copy_(ema_updater.update_average(ma_params, current_params))
 
 class EMA():
     """
@@ -70,7 +70,7 @@ class EMA():
     def update_average(self, old, new):
         if old is None:
             return new
-        return old * self.beta + (1 - self.beta) * new
+        return old.lerp(new, 1 - self.beta)
 
 # --- 데이터 처리 및 학습 루프 ---
 
@@ -308,7 +308,7 @@ class W_JEPA(nn.Module):
         return loss
 
 class AudioDataset(Dataset):
-    def __init__(self, root_dir='./ganyu', target_sampling_rate=16000, min_duration_sec=5.0):
+    def __init__(self, root_dir='./ganyu', target_sampling_rate=16000, min_duration_sec=0.5):
         self.root_dir = root_dir
         self.target_sampling_rate = target_sampling_rate
         
@@ -324,7 +324,7 @@ class AudioDataset(Dataset):
             try:
                 info = torchaudio.info(filepath)
                 duration = info.num_frames / info.sample_rate
-                if duration >= min_duration_sec:
+                if duration > min_duration_sec:
                     self.filepaths.append(filepath)
             except Exception as e:
                 print(f"Warning: Could not read info for {filepath}, skipping. Error: {e}")
@@ -365,8 +365,7 @@ def get_lr_scheduler(optimizer, max_iter, warmup_iter, final_lr):
     base_lr = optimizer.param_groups[0]['lr']
     def lr_lambda(current_iter):
         if current_iter < warmup_iter:
-            # Use current_iter + 1 for warmup to avoid LR=0 at the very start
-            return float(current_iter + 1) / float(max(1, warmup_iter))
+            return float(current_iter) / float(max(1, warmup_iter))
         elif current_iter >= max_iter:
             return final_lr / base_lr
         else:
@@ -382,11 +381,11 @@ def main():
     use_cuda = torch.cuda.is_available()
     print(f"Using device: {device}")
 
-    batch_size = 32
+    batch_size = 24
     base_learning_rate = 3e-4
-    final_learning_rate = 1e-9
-    num_epochs = 30
-    accumulation_steps = 8
+    final_learning_rate = 1e-8
+    num_epochs = 300
+    accumulation_steps = 5
     ema_decay = 0.996
 
     # --- 모델 하이퍼파라미터 설정 ---
@@ -412,7 +411,7 @@ def main():
     full_dataset = AudioDataset(min_duration_sec=5.0)
 
     dataset_size = len(full_dataset)
-    val_size = int(0.2 * dataset_size)
+    val_size = int(0.1 * dataset_size)
     train_size = dataset_size - val_size
     print(f"Splitting dataset: {train_size} for training, {val_size} for validation.")
     
