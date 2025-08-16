@@ -144,7 +144,7 @@ class MaskCollator(object):
         Returns:
             Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]], Optional[torch.Tensor]]:
             - waveforms: (B, 1, T_audio)
-            - full_mask: List of B tensors, each with indices of frames to be masked.
+            - ctx_mask: List of B tensors, each with indices of frames to be masked.
             - target_mask: (B, N, S) tensor with indices of spans for the reconstruction target.
         """
         result = self.default_collate(batch, **self.collate_kwargs)
@@ -156,14 +156,30 @@ class MaskCollator(object):
         _lengths = self._get_feat_extract_output_lengths(lengths)
         frame_lengths = _lengths.tolist()
         
-        full_masks_lists, extracted_spans_np = self.create_mask_indices_with_extraction(
+        # This function still generates the potential targets based on the original masking ratio
+        _, extracted_spans_np = self.create_mask_indices_with_extraction(
             frame_lengths, self.span, self.mask_ratio
         )
         
-        # Convert full_masks to a list of torch.Tensors
-        full_mask = [torch.tensor(mask, dtype=torch.long) for mask in full_masks_lists]
+        # NEW: The context mask (ctx_mask) is now derived directly from the target spans
+        ctx_masks_lists = []
+        if extracted_spans_np.size > 0:
+            for b in range(extracted_spans_np.shape[0]):
+                # Flatten the target span indices for this batch item into a single list
+                batch_indices = extracted_spans_np[b].flatten().tolist()
+                # Remove padding (-1), remove duplicates, and sort
+                unique_indices = sorted(list(set(idx for idx in batch_indices if idx != -1)))
+                ctx_masks_lists.append(unique_indices)
         
-        # Convert extracted_spans numpy array to a torch.Tensor
+        # If there were no target spans, create a list of empty lists
+        if not ctx_masks_lists:
+             B = len(_lengths)
+             ctx_masks_lists = [[] for _ in range(B)]
+
+        # Convert the new context masks to a list of torch.Tensors
+        ctx_mask = [torch.tensor(mask, dtype=torch.long) for mask in ctx_masks_lists]
+        
+        # Convert extracted_spans numpy array to a torch.Tensor for the target_mask
         if extracted_spans_np.size > 0:
             target_mask = torch.from_numpy(extracted_spans_np)
         else:
@@ -171,7 +187,7 @@ class MaskCollator(object):
             B = len(_lengths)
             target_mask = torch.empty((B, 0, self.span), dtype=torch.long)
             
-        return waveforms, lengths, full_mask, target_mask
+        return waveforms, lengths, ctx_mask, target_mask
     
     def create_mask_indices_with_extraction(self, lengths: List[int], span: int, mask_ratio: float) -> Tuple[List[List[int]], np.ndarray]:
         if not lengths:
