@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple
 
+# ConvNeXt의 핵심 구성 요소인 1D ConvNeXt 블록입니다.
+# 이 블록은 입력과 출력의 길이(resolution)를 변경하지 않고 특징을 처리합니다.
 class ConvNeXtBlock1D(nn.Module):
     """
     ConvNeXt Block for 1D data.
@@ -16,7 +18,7 @@ class ConvNeXtBlock1D(nn.Module):
         # 1. Depthwise Convolution: 각 채널을 독립적으로 처리하여 공간/시간적 특징을 학습합니다.
         # 'padding="same"'을 사용하여 입력과 출력의 길이를 동일하게 유지합니다.
         self.dwconv = nn.Conv1d(
-            dim, dim, kernel_size=kernel_size, padding="same", groups=dim
+            dim, dim, kernel_size=kernel_size, padding=(kernel_size-1)//2, groups=dim
         )
         
         # 2. Layer Normalization: 배치 크기에 의존하지 않는 정규화 방식입니다.
@@ -55,7 +57,7 @@ class ConvNeXtBlock1D(nn.Module):
 
 # Feature_Extractor의 역연산을 수행하는 ConvNeXt 스타일 Decoder
 class Decoder(nn.Module):
-    def __init__(self, conv_configs: List[Tuple[int, int, int]], dropout: float = 0.0, initial_input_length: int = 16000):
+    def __init__(self, conv_configs: List[Tuple[int, int, int]], dropout: float = 0.0):
         super().__init__()
         
         self.decoder_layers = nn.ModuleList()
