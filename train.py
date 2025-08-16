@@ -139,13 +139,8 @@ class MaskCollator(object):
 
     def __call__(self, batch):
         """
-        Processes a batch of audio, creates masks, and returns data in the specified format.
-        
-        Returns:
-            Tuple[Optional[torch.Tensor], Optional[List[torch.Tensor]], Optional[torch.Tensor]]:
-            - waveforms: (B, 1, T_audio)
-            - ctx_mask: List of B tensors, each with indices of frames to be masked.
-            - target_mask: (B, N, S) tensor with indices of spans for the reconstruction target.
+        Processes a batch of audio, creates a SHARED mask for all samples, 
+        and returns data in the specified format.
         """
         result = self.default_collate(batch, **self.collate_kwargs)
         
@@ -153,74 +148,34 @@ class MaskCollator(object):
             return None, None, None, None
         
         waveforms, lengths = result
+        B = waveforms.shape[0]
         _lengths = self._get_feat_extract_output_lengths(lengths)
-        frame_lengths = _lengths.tolist()
         
-        # This function still generates the potential targets based on the original masking ratio
-        _, extracted_spans_np = self.create_mask_indices_with_extraction(
-            frame_lengths, self.span, self.mask_ratio
-        )
-        
-        # NEW: The context mask (ctx_mask) is now derived directly from the target spans
-        ctx_masks_lists = []
-        if extracted_spans_np.size > 0:
-            for b in range(extracted_spans_np.shape[0]):
-                # Flatten the target span indices for this batch item into a single list
-                batch_indices = extracted_spans_np[b].flatten().tolist()
-                # Remove padding (-1), remove duplicates, and sort
-                unique_indices = sorted(list(set(idx for idx in batch_indices if idx != -1)))
-                ctx_masks_lists.append(unique_indices)
-        
-        # If there were no target spans, create a list of empty lists
-        if not ctx_masks_lists:
-             B = len(_lengths)
-             ctx_masks_lists = [[] for _ in range(B)]
+        # Use the length of the first sample as a reference to generate a shared mask
+        ref_length = _lengths[0].item()
 
-        # Convert the new context masks to a list of torch.Tensors
-        ctx_mask = [torch.tensor(mask, dtype=torch.long) for mask in ctx_masks_lists]
+        # 1. Create one shared mask based on the reference length
+        shared_full_mask = self._create_full_masks([ref_length], self.span, self.mask_ratio)[0]
         
-        # Convert extracted_spans numpy array to a torch.Tensor for the target_mask
-        if extracted_spans_np.size > 0:
-            target_mask = torch.from_numpy(extracted_spans_np)
+        # 2. Extract target spans from this shared mask
+        target_spans = self._extract_spans_from_mask(shared_full_mask, self.span)
+        N = len(target_spans)
+
+        # 3. The context mask (ctx_mask) is now the same for all samples.
+        #    It's defined by the indices of the target spans.
+        ctx_mask_indices = sorted(list(set(idx for span in target_spans for idx in span)))
+        ctx_mask_tensor = torch.tensor(ctx_mask_indices, dtype=torch.long)
+        ctx_mask = [ctx_mask_tensor] * B
+
+        # 4. Create the target_mask tensor by replicating the shared spans
+        if N > 0:
+            target_spans_np = np.array(target_spans, dtype=int)
+            # Create a (1, N, S) tensor and expand it to (B, N, S)
+            target_mask = torch.from_numpy(target_spans_np).unsqueeze(0).expand(B, -1, -1)
         else:
-            # Create an empty tensor if no spans were extracted
-            B = len(_lengths)
             target_mask = torch.empty((B, 0, self.span), dtype=torch.long)
             
         return waveforms, lengths, ctx_mask, target_mask
-    
-    def create_mask_indices_with_extraction(self, lengths: List[int], span: int, mask_ratio: float) -> Tuple[List[List[int]], np.ndarray]:
-        if not lengths:
-            return [], np.array([])
-        
-        full_masks = self._create_full_masks(lengths, span, mask_ratio)
-        
-        all_spans = []
-        min_num_spans = float('inf')
-        
-        for mask_indices in full_masks:
-            spans = self._extract_spans_from_mask(mask_indices, span)
-            all_spans.append(spans)
-            min_num_spans = min(min_num_spans, len(spans))
-        
-        if min_num_spans == float('inf'):
-            min_num_spans = 0
-        
-        N = int(min_num_spans)
-        B = len(lengths)
-        
-        if N == 0:
-            return full_masks, np.array([])
-        
-        extracted_spans = np.full((B, N, span), -1, dtype=int)
-        
-        for b, spans in enumerate(all_spans):
-            selected_spans = random.sample(spans, N) if len(spans) >= N else spans
-            for n, span_indices in enumerate(selected_spans):
-                for s, idx in enumerate(span_indices):
-                    extracted_spans[b, n, s] = idx
-        
-        return full_masks, extracted_spans
     
     def _create_full_masks(self, lengths: List[int], span: int, mask_ratio: float) -> List[List[int]]:
         result = []

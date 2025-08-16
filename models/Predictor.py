@@ -40,42 +40,39 @@ def create_span_targets(features: torch.Tensor, target_mask: torch.Tensor) -> Op
     
 def apply_masks(features: torch.Tensor, full_masks: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Applies masks by dropping the selected feature frames.
+    Applies a shared mask to a batch of features in a vectorized manner.
     
     Args:
-        features: (B, n_mels, T) - Original mel spectrogram features.
-        full_masks: A list of B tensors, each containing frame indices to drop.
+        features: (B, D, T) - Original mel spectrogram features, padded to the same length.
+        full_masks: A list of B identical tensors, each containing frame indices to drop.
         
     Returns:
-        - dropped_padded_features: (B, n_mels, T_unmasked) Features after dropping and padding.
-        - unmasked_lengths: (B,) Tensor with the lengths of each sequence before padding.
+        - dropped_features: (B, D, T_unmasked) Features after dropping frames.
+        - unmasked_lengths: (B,) Tensor with the new, identical lengths of each sequence.
     """
     B, D, T = features.shape
-    unmasked_features_list = []
-    unmasked_lengths = []
     
-    for i in range(B):
-        drop_indices = full_masks[i].to(features.device)
+    # Since the mask is shared, we can take the first one. It's a list of identical tensors.
+    if not full_masks or full_masks[0].numel() == 0:
+        # If there's no mask, return features as is
+        return features, torch.full((B,), T, dtype=torch.long, device=features.device)
+
+    drop_indices = full_masks[0].to(features.device)
+    
+    # Create a boolean mask of frames to KEEP
+    keep_mask = torch.ones(T, dtype=torch.bool, device=features.device)
+    keep_mask[drop_indices] = False
         
-        # Create a boolean mask of frames to KEEP
-        keep_mask = torch.ones(T, dtype=torch.bool, device=features.device)
-        if drop_indices.numel() > 0:
-            keep_mask[drop_indices] = False
-            
-        # Select frames to keep: features[i] is (n_mels, T)
-        unmasked_sample = features[i][:, keep_mask]
-        unmasked_features_list.append(unmasked_sample)
-        unmasked_lengths.append(unmasked_sample.shape[1])
-        
-    # Pad the sequences to the max length in the batch
-    # pad_sequence expects (T, *), so we need to transpose, pad, then transpose back
-    unmasked_features_transposed = [f.transpose(0, 1) for f in unmasked_features_list]
-    padded_transposed = pad_sequence(unmasked_features_transposed, batch_first=True, padding_value=0.0)
+    # Apply the same boolean mask to all samples in the batch
+    # features is (B, D, T), we want to index the last dimension (T)
+    # keep_mask is (T,), it will be broadcasted.
+    dropped_features = features[:, :, keep_mask]
     
-    # Transpose back to (B, n_mels, T_padded)
-    dropped_padded_features = padded_transposed.transpose(1, 2)
+    # The new length is the same for all samples
+    new_length = dropped_features.shape[2]
+    unmasked_lengths = torch.full((B,), new_length, dtype=torch.long, device=features.device)
     
-    return dropped_padded_features, torch.tensor(unmasked_lengths, dtype=torch.long, device=features.device)
+    return dropped_features, unmasked_lengths
 
 class Predictor(nn.Module):
     def __init__(self, in_dim:int, dim:int, nlayers:int, nhead:int, ratio:float, max_seq_len:int, droppath: float = 0.0):
@@ -119,7 +116,7 @@ class Predictor(nn.Module):
 
         # tgt
         pos_embed_base_repeated = self.pos_embed.expand(B, -1, -1)[:, :N_ctx_total, :].repeat_interleave(M, dim=0)
-        tgt_mask_reshaped = tgt_mask.view(B * M, 1, N_tgt)
+        tgt_mask_reshaped = tgt_mask.reshape(B * M, 1, N_tgt)
         
         tgt_pos_embed = create_span_targets(
             pos_embed_base_repeated.permute(0, 2, 1), tgt_mask_reshaped
